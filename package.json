@@ -1,0 +1,36 @@
+{
+  "name": "bookwise-api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "NODE_ENV=production node index.js",
+    "dev": "NODE_ENV=development APP_ENV=local node --watch index.js",
+    "migrate:mysql": "node migrate-sqlite-to-mysql.js",
+    "pw:install": "playwright install chromium",
+    "pw:check": "node playwright/smoke.js",
+    "test:smsto": "node scripts/test-smsto.mjs",
+    "test:sms-direct": "node scripts/send-test-sms.mjs",
+    "test:resend": "node scripts/send-resend-test.mjs"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "imapflow": "^1.2.18",
+    "mailparser": "^3.9.6",
+    "multer": "^2.1.0",
+    "mysql2": "^3.20.0",
+    "node-cron": "^4.2.1",
+    "playwright": "^1.58.2",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "xlsx": "^0.18.5"
+  },
+  "description": "სრული ბექი — ლაივზე გადაიტანე **მთელი `server/` ფოლდერი** (ან git clone-ის შემდეგ მხოლოდ ეს დირექტორია).",
+  "main": "index.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
