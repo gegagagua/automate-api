@@ -782,7 +782,7 @@ app.post("/api/companies/:companyId/imports/:importId/run", async (req, res) => 
       accountCode: uploadEntry.accountCode || accountCodeOverride,
       successScreenshotPath,
       failureScreenshotPath,
-      headless: debugMode ? false : true,
+      headless: true,
       slowMo: Number.isNaN(slowMoMs) ? undefined : slowMoMs,
     });
     await db.run(`DELETE FROM balance_import_row_outcomes WHERE importId = ?`, [importId]);
@@ -909,6 +909,202 @@ app.post("/api/companies/:companyId/imports/:importId/run", async (req, res) => 
       error: error instanceof Error ? error.message : "Unknown error",
       emailNotification,
     });
+  }
+});
+
+app.get("/api/companies/:companyId/imports/:importId/run-stream", async (req, res) => {
+  const companyId = Number(req.params.companyId);
+  const importId = Number(req.params.importId);
+  if (!companyId || !importId) {
+    return res.status(400).json({ message: "Invalid companyId or importId" });
+  }
+
+  const db = await dbPromise;
+  const company = await getCompanyForUser(db, companyId, req.authUser);
+  if (!company) {
+    return res.status(404).json({ message: "Company not found" });
+  }
+
+  const uploadEntry = await db.get(
+    `SELECT id, fileName, storedFileName, accountCode, totalRows
+     FROM company_excel_uploads
+     WHERE id = ? AND companyId = ?`,
+    [importId, companyId],
+  );
+  if (!uploadEntry?.storedFileName) {
+    return res.status(404).json({ message: "Uploaded file not found" });
+  }
+
+  const filePath = path.join(uploadsDir, uploadEntry.storedFileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ message: "Stored file does not exist on server" });
+  }
+
+  const balanceCardTitle = String(company.name ?? "").trim();
+  if (!balanceCardTitle) {
+    return res.status(400).json({
+      message: "Company name is required for Balance: it must match the MyDatabase card title.",
+    });
+  }
+
+  const debugMode = req.query?.debugMode === "true";
+  const slowMoMs = Number(req.query?.slowMoMs);
+  const accountCodeOverride =
+    typeof req.query?.accountCode === "string" && req.query.accountCode.trim().length > 0
+      ? req.query.accountCode.trim()
+      : undefined;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  req.socket?.setNoDelay(true);
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    const chunk = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    console.log(`[run-stream] send event=${event} bytes=${chunk.length}`);
+    res.write(chunk);
+    req.socket?.write?.("", "utf8", () => {});
+    if (typeof res.flush === "function") res.flush();
+  };
+
+  const keepalive = setInterval(() => {
+    res.write(": keepalive\n\n");
+    if (typeof res.flush === "function") res.flush();
+  }, 15000);
+
+  send("start", { message: "Starting balance workflow…", companyId, importId });
+
+  await mkdir(resultsDir, { recursive: true });
+  const resultFileBase = `${Date.now()}-${randomUUID()}-company-${companyId}-import-${importId}`;
+  const successScreenshotFileName = `${resultFileBase}-success.png`;
+  const failureScreenshotFileName = `${resultFileBase}-fail.png`;
+  const successScreenshotPath = path.join(resultsDir, successScreenshotFileName);
+  const failureScreenshotPath = path.join(resultsDir, failureScreenshotFileName);
+
+  const runStartedMs = Date.now();
+
+  try {
+    const result = await runBalanceWorkflow({
+      loginEmail: company.email,
+      loginPassword: company.balancePassword,
+      companyName: balanceCardTitle,
+      filePath,
+      accountCode: uploadEntry.accountCode || accountCodeOverride,
+      successScreenshotPath,
+      failureScreenshotPath,
+      headless: true,
+      slowMo: Number.isNaN(slowMoMs) ? undefined : slowMoMs,
+      onStep: ({ step }) => {
+        send("step", { step });
+      },
+      onScreenshot: ({ frame, label }) => {
+        send("screenshot", { frame, label });
+      },
+    });
+
+    await db.run(`DELETE FROM balance_import_row_outcomes WHERE importId = ?`, [importId]);
+    for (const row of result.rowOutcomes || []) {
+      await db.run(
+        `INSERT INTO balance_import_row_outcomes (importId, rowIndex, rowKey, outcome, message, warning, objectName, transactionType, amountText, detailJson)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          importId,
+          row.rowIndex,
+          row.rowKey || null,
+          row.outcome,
+          row.message || null,
+          row.warning || null,
+          row.objectName || null,
+          row.transactionType || null,
+          row.amountText || null,
+          row.detailJson || null,
+        ],
+      );
+    }
+
+    const analyticsPayload =
+      result.analytics &&
+      JSON.stringify({
+        ...result.analytics,
+        rowOutcomeSummary: result.rowOutcomeSummary ?? null,
+      });
+
+    await db.run(
+      `UPDATE company_excel_uploads
+       SET runStatus = ?, runMessage = ?, runAnalyticsJson = ?, resultScreenshotFileName = ?, lastRunAt = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      ["success", result.message ?? "Run completed successfully.", analyticsPayload, successScreenshotFileName, importId],
+    );
+
+    const processingSeconds = (Date.now() - runStartedMs) / 1000;
+    let runLog = null;
+    try {
+      runLog = await recordBalanceImportRun(db, {
+        companyId,
+        importId,
+        runStatus: "success",
+        rowOutcomeSummary: result.rowOutcomeSummary,
+        rowOutcomes: result.rowOutcomes,
+        processingSeconds,
+        workflowError: null,
+      });
+    } catch (logErr) {
+      console.error("[balance-import-run] insert failed (success path)", logErr);
+    }
+
+    send("done", {
+      ok: true,
+      message: result.message,
+      steps: result.steps,
+      analytics: result.analytics,
+      rowOutcomes: result.rowOutcomes,
+      rowOutcomeSummary: result.rowOutcomeSummary,
+      screenshotFileName: successScreenshotFileName,
+      processingSeconds,
+      runLog,
+    });
+  } catch (error) {
+    const processingSeconds = (Date.now() - runStartedMs) / 1000;
+
+    await db.run(
+      `UPDATE company_excel_uploads
+       SET runStatus = ?, runMessage = ?, runAnalyticsJson = ?, resultScreenshotFileName = ?, lastRunAt = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        "failed",
+        error instanceof Error ? error.message : "Unknown error",
+        null,
+        failureScreenshotFileName,
+        importId,
+      ],
+    );
+
+    try {
+      await recordBalanceImportRun(db, {
+        companyId,
+        importId,
+        runStatus: "failed",
+        rowOutcomeSummary: null,
+        rowOutcomes: [],
+        processingSeconds,
+        workflowError: error,
+      });
+    } catch (logErr) {
+      console.error("[balance-import-run] insert failed (failure path)", logErr);
+    }
+
+    send("error", {
+      ok: false,
+      message: error instanceof Error ? error.message : "Unknown error",
+      steps: error.steps ?? [],
+      screenshotFileName: failureScreenshotFileName,
+      processingSeconds,
+    });
+  } finally {
+    clearInterval(keepalive);
+    res.end();
   }
 });
 

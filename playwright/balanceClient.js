@@ -493,6 +493,16 @@ const analyzeGeneratedRows = async (page, preferredFrame = null) => {
   };
 };
 
+const captureFrame = async (page, label, onScreenshot) => {
+  if (!onScreenshot) return;
+  try {
+    const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: false });
+    onScreenshot({ frame: buf.toString("base64"), label });
+  } catch {
+    // ignore screenshot capture errors
+  }
+};
+
 export const runBalanceWorkflow = async ({
   loginEmail,
   loginPassword,
@@ -503,6 +513,8 @@ export const runBalanceWorkflow = async ({
   failureScreenshotPath,
   headless = process.env.PLAYWRIGHT_HEADLESS !== "false",
   slowMo = Number(process.env.PLAYWRIGHT_SLOW_MO ?? 800),
+  onScreenshot = null,
+  onStep = null,
 }) => {
   const browser = await chromium.launch({
     headless,
@@ -526,7 +538,17 @@ export const runBalanceWorkflow = async ({
   const steps = [];
   const markStep = (step) => {
     steps.push(step);
+    try { onStep?.({ step }); } catch { /* ignore */ }
   };
+
+  const activePageRef = { current: page };
+
+  let screenshotTimer = null;
+  if (onScreenshot) {
+    screenshotTimer = setInterval(async () => {
+      await captureFrame(activePageRef.current, "periodic", onScreenshot).catch(() => {});
+    }, 5000);
+  }
 
   try {
     markStep("open-balance-home");
@@ -547,6 +569,7 @@ export const runBalanceWorkflow = async ({
     await page.click("button.dark_btn");
     await page.waitForTimeout(5000);
     await dismissInterruptingDialogs(page);
+    await captureFrame(page, "after-login", onScreenshot);
 
     markStep("open-company-window");
     const name = String(companyName || "").trim();
@@ -600,11 +623,13 @@ export const runBalanceWorkflow = async ({
 
     const companyPage = popupPage ?? page;
     currentPage = companyPage;
+    activePageRef.current = companyPage;
 
     await companyPage.waitForLoadState("domcontentloaded");
     await companyPage.waitForLoadState("networkidle").catch(() => undefined);
     await companyPage.waitForTimeout(4500);
     await dismissInterruptingDialogs(companyPage);
+    await captureFrame(companyPage, "company-page-loaded", onScreenshot);
 
     markStep("go-to-cash-section");
     const cashCandidates = [
@@ -636,11 +661,13 @@ export const runBalanceWorkflow = async ({
     }
 
     await companyPage.waitForTimeout(7000);
+    await captureFrame(companyPage, "cash-section-opened", onScreenshot);
 
     markStep("open-bank-upload-page");
     await companyPage.click('text="ბანკიდან ამონაწერის ჩატვირთვა"');
     await companyPage.waitForTimeout(5000);
     await dismissInterruptingDialogs(companyPage);
+    await captureFrame(companyPage, "bank-upload-page", onScreenshot);
 
     markStep("select-bank-account-first");
     await selectFirstBank(companyPage);
@@ -675,10 +702,12 @@ export const runBalanceWorkflow = async ({
     await companyPage.click('text="OK"');
     await companyPage.waitForTimeout(8000);
     await dismissInterruptingDialogs(companyPage);
+    await captureFrame(companyPage, "after-upload-confirm", onScreenshot);
 
     markStep("wait-generated-list");
     const generatedListDetection = await waitForGeneratedRows(companyPage);
     await companyPage.waitForTimeout(2000);
+    await captureFrame(companyPage, "generated-list", onScreenshot);
 
     const gridWaitMs = Number(process.env.BALANCE_GRID_WAIT_MS ?? 120000);
     markStep(`wait-balance-grid-data-${gridWaitMs}ms`);
@@ -720,6 +749,7 @@ export const runBalanceWorkflow = async ({
       },
     };
 
+    await captureFrame(companyPage, "before-per-row-automation", onScreenshot);
     markStep("per-row-balance-rules-and-ui");
     let rowOutcomes = [];
     let rowOutcomeSummary = {
@@ -751,6 +781,8 @@ export const runBalanceWorkflow = async ({
       rowOutcomeSummary = summarizeRowOutcomes(rowOutcomes);
     }
 
+    await captureFrame(currentPage, "after-per-row-automation", onScreenshot);
+
     if (successScreenshotPath) {
       await currentPage.screenshot({ path: successScreenshotPath, fullPage: true });
     }
@@ -772,6 +804,7 @@ export const runBalanceWorkflow = async ({
       rowOutcomeSummary,
     };
   } catch (error) {
+    await captureFrame(currentPage, "on-error", onScreenshot).catch(() => undefined);
     if (failureScreenshotPath) {
       try {
         await currentPage.screenshot({ path: failureScreenshotPath, fullPage: true });
@@ -784,6 +817,7 @@ export const runBalanceWorkflow = async ({
     workflowError.steps = steps;
     throw workflowError;
   } finally {
+    if (screenshotTimer) clearInterval(screenshotTimer);
     await context.close();
     await browser.close();
   }

@@ -1,15 +1,11 @@
-import { profile } from "../config/index.js";
-import { DEFAULT_RESEND_API_KEY } from "../config/resendDefaults.js";
 import {
   buildBalanceReportHtml,
   formatRowOutcomeSummaryLines,
   formatRowOutcomesHumanText,
 } from "./balanceReportFormat.js";
+import { sendMailjetEmail } from "./mailjetSend.js";
 
-const RESEND_API = "https://api.resend.com/emails";
 const DEFAULT_NOTIFY_EMAIL = "gegagagua@gmail.com";
-const DEFAULT_FROM = "Bookwise <info@book-wise.ge>";
-const RESEND_SANDBOX_FROM = "Bookwise <onboarding@resend.dev>";
 const MAX_BODY_CHARS = 45_000;
 const MAX_HTML_CHARS = 200_000;
 
@@ -20,11 +16,9 @@ const clipHtml = (html) => {
   return `${html.slice(0, MAX_HTML_CHARS)}\n<!-- truncated -->`;
 };
 
-const resolveApiKey = () => process.env.RESEND_API_KEY?.trim() || DEFAULT_RESEND_API_KEY;
-
 const resolveNotifyEmail = () =>
   process.env.BALANCE_NOTIFY_EMAIL?.trim() ||
-  process.env.RESEND_NOTIFY_EMAIL?.trim() ||
+  process.env.MAILJET_NOTIFY_EMAIL?.trim() ||
   DEFAULT_NOTIFY_EMAIL;
 
 const simpleEmailOk = (value) => {
@@ -40,43 +34,6 @@ const pickBalanceReportRecipient = (notifyTo) => {
     return String(notifyTo).trim();
   }
   return resolveNotifyEmail();
-};
-
-const resolveFrom = () => process.env.RESEND_FROM?.trim() || DEFAULT_FROM;
-
-const buildFromCandidates = () => {
-  const preferred = resolveFrom();
-  const list = [];
-  const add = (v) => {
-    const t = String(v ?? "").trim();
-    if (t.length > 0 && !list.includes(t)) {
-      list.push(t);
-    }
-  };
-  add(preferred);
-  add(DEFAULT_FROM);
-  add(process.env.RESEND_FROM_FALLBACK?.trim());
-  const allowSandbox =
-    profile !== "prod" || String(process.env.RESEND_ALLOW_SANDBOX_FROM ?? "").trim() === "1";
-  if (allowSandbox) {
-    add(RESEND_SANDBOX_FROM);
-  }
-  return list;
-};
-
-const shouldRetryResendWithFallbackFrom = (httpStatus, data) => {
-  if (httpStatus !== 403 && httpStatus !== 422) {
-    return false;
-  }
-  const blob = `${JSON.stringify(data ?? {})}`.toLowerCase();
-  return (
-    blob.includes("domain") ||
-    blob.includes("verify") ||
-    blob.includes("invalid 'from'") ||
-    blob.includes("from field") ||
-    blob.includes("sender") ||
-    blob.includes("restricted")
-  );
 };
 
 const toJson = (value) => {
@@ -166,65 +123,14 @@ const formatRunLogProof = (runLog) => {
   return lines.join("\n");
 };
 
-const sendResendEmail = async ({ to, subject, text, html }) => {
-  const apiKey = resolveApiKey();
+const sendEmail = async ({ to, subject, text, html }) => {
   const bodyText = clip(text);
   const bodyHtml = clipHtml(
     html && typeof html === "string"
       ? html
       : `<pre style="white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px">${escapeHtml(bodyText)}</pre>`,
   );
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 28_000);
-  const fromCandidates = buildFromCandidates();
-  let lastFail = { httpStatus: 0, data: {} };
-  try {
-    for (let i = 0; i < fromCandidates.length; i += 1) {
-      const from = fromCandidates[i];
-      const response = await fetch(RESEND_API, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          from,
-          to: [to],
-          subject,
-          text: bodyText,
-          html: bodyHtml,
-        }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok) {
-        clearTimeout(timer);
-        if (i > 0) {
-          console.warn("[resend] sent using fallback from after preferred rejected", {
-            from,
-            to,
-            prevFrom: fromCandidates[0],
-          });
-        }
-        console.log("[resend] email sent", { id: data.id, to, from });
-        return { ok: true, httpStatus: response.status, data, fromUsed: from };
-      }
-      lastFail = { httpStatus: response.status, data };
-      console.error("[resend] email rejected", response.status, data, { from, to });
-      const hasMore = i < fromCandidates.length - 1;
-      const canRetry = hasMore && shouldRetryResendWithFallbackFrom(response.status, data);
-      if (!canRetry) {
-        break;
-      }
-      console.warn("[resend] retrying with next from candidate", { next: fromCandidates[i + 1] });
-    }
-    clearTimeout(timer);
-    return { ok: false, httpStatus: lastFail.httpStatus, data: lastFail.data };
-  } catch (err) {
-    clearTimeout(timer);
-    console.error("[resend] email failed", err);
-    return { ok: false, reason: "fetch_error", error: err instanceof Error ? err.message : String(err) };
-  }
+  return sendMailjetEmail({ to, subject, text: bodyText, html: bodyHtml });
 };
 
 export async function sendBalanceRunEmailNotification({
@@ -238,13 +144,10 @@ export async function sendBalanceRunEmailNotification({
 }) {
   const notifyEmail = pickBalanceReportRecipient(notifyTo);
   const recipientSource = simpleEmailOk(notifyTo) ? "user_profile" : "env_fallback";
-  const sandboxFromEligible =
-    profile !== "prod" || String(process.env.RESEND_ALLOW_SANDBOX_FROM ?? "").trim() === "1";
   const attachNotifyMeta = (out) => ({
     ...out,
     recipientEmail: notifyEmail,
     recipientSource,
-    sandboxFromEligible,
   });
   const companyName = String(company?.name ?? "").trim() || "—";
   const companyId = company?.id ?? "—";
@@ -335,20 +238,18 @@ export async function sendBalanceRunEmailNotification({
       errorBanner: status === "failed" ? errMsg : "",
     });
 
-    const out = await sendResendEmail({ to: notifyEmail, subject, text: bodyText, html });
-    console.log("[resend] balance run report", {
+    const out = await sendEmail({ to: notifyEmail, subject, text: bodyText, html });
+    console.log("[mailjet] balance run report", {
       importId,
       status,
       ok: out.ok,
       to: notifyEmail,
       recipientSource,
-      fromUsed: out.fromUsed,
       httpStatus: out.httpStatus,
-      sandboxFromEligible,
     });
     return attachNotifyMeta(out);
   } catch (buildErr) {
-    console.error("[resend] balance run report body failed, sending minimal mail", buildErr);
+    console.error("[mailjet] balance run report body failed, sending minimal mail", buildErr);
     const minimalText = [
       `Could not build full report: ${buildErr instanceof Error ? buildErr.message : String(buildErr)}`,
       "",
@@ -361,27 +262,25 @@ export async function sendBalanceRunEmailNotification({
     ]
       .filter(Boolean)
       .join("\n");
-    const out = await sendResendEmail({
+    const out = await sendEmail({
       to: notifyEmail,
       subject: `${subject} (summary only)`,
       text: minimalText,
     });
-    console.log("[resend] balance run report (fallback)", {
+    console.log("[mailjet] balance run report (fallback)", {
       importId,
       status,
       ok: out.ok,
       to: notifyEmail,
       recipientSource,
-      fromUsed: out.fromUsed,
       httpStatus: out.httpStatus,
-      sandboxFromEligible,
     });
     return attachNotifyMeta(out);
   }
 }
 
 export async function sendResendTestEmail(message = "test") {
-  return sendResendEmail({
+  return sendEmail({
     to: resolveNotifyEmail(),
     subject: "[Bookwise] Resend test",
     text: String(message),
@@ -391,7 +290,7 @@ export async function sendResendTestEmail(message = "test") {
 export async function sendBalanceNotifyProbeEmail(notifyTo) {
   const notifyEmail = pickBalanceReportRecipient(notifyTo);
   const when = new Date().toISOString();
-  const out = await sendResendEmail({
+  const out = await sendEmail({
     to: notifyEmail,
     subject: "[Bookwise] Balance notify test",
     text: [
