@@ -1,19 +1,53 @@
-import { chromium } from "playwright";
 import {
   GRID_INTERPRETATION_HINTS_GEO,
   waitForBalanceGridData,
 } from "./balanceGridExtract.js";
+import { createBalanceAutomationBrowser } from "./browser.js";
 import { balanceSessionLogout, runBalancePerRowAutomation } from "./balanceGridAutomation.js";
 import { summarizeRowOutcomes } from "./balanceRowRules.js";
 
 const DEFAULT_ACCOUNT_CODE = process.env.BALANCE_ACCOUNT_CODE ?? "1210.01";
 const COMPANY_OPEN_TIMEOUT = 60000;
-const VIEWPORT_WIDTH = 1440;
-const VIEWPORT_HEIGHT = 900;
 
 const escapeForTextSelector = (value) => String(value).replace(/"/g, '\\"');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const isCloudflareTurnstileVisible = async (page) => {
+  const locators = [
+    page.getByText(/Performing security verification/i).first(),
+    page.getByText(/Verify you are human/i).first(),
+    page.locator('iframe[src*="challenges.cloudflare.com"]').first(),
+    page.locator('iframe[src*="turnstile"]').first(),
+  ];
+  for (const loc of locators) {
+    try {
+      if (await loc.isVisible({ timeout: 700 }).catch(() => false)) {
+        return true;
+      }
+    } catch {
+      // try next
+    }
+  }
+  return false;
+};
+
+const assertNoCloudflareBlock = async (page, stepLabel, maxWaitMs = 35000) => {
+  if (!(await isCloudflareTurnstileVisible(page))) return;
+
+  // Cloudflare's non-interactive challenge sometimes auto-solves in ~10-20s; wait before giving up.
+  const started = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    await page.waitForTimeout(2500);
+    if (!(await isCloudflareTurnstileVisible(page))) return;
+  }
+
+  throw new Error(
+    `ANTI_BOT_CHALLENGE: Cloudflare/Turnstile blocked automation (${stepLabel}). ` +
+      "Enable debug run (headed browser on the API host), or set PLAYWRIGHT_BALANCE_HEADLESS=false with a GUI, " +
+      "or PLAYWRIGHT_CHANNEL=chrome. After a manual solve, save storageState and set PLAYWRIGHT_STORAGE_STATE.",
+  );
+};
 
 const dismissInterruptingDialogs = async (page) => {
   const cancelLocators = [
@@ -516,23 +550,10 @@ export const runBalanceWorkflow = async ({
   onScreenshot = null,
   onStep = null,
 }) => {
-  const browser = await chromium.launch({
+  const { browser, context, page } = await createBalanceAutomationBrowser({
     headless,
     slowMo: Number.isNaN(slowMo) ? 800 : slowMo,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
-    ],
   });
-
-  const context = await browser.newContext({
-    viewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
-    screen: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  });
-  const page = await context.newPage();
-  await page.addInitScript("Object.defineProperty(navigator, 'webdriver', { get: () => false });");
   let currentPage = page;
 
   const steps = [];
@@ -554,6 +575,7 @@ export const runBalanceWorkflow = async ({
     markStep("open-balance-home");
     await page.goto("https://www.balance.ge", { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(3000);
+    await assertNoCloudflareBlock(page, "balance-home");
 
     markStep("open-login-page");
     await page.click('a[href*="/login"]');
@@ -569,6 +591,7 @@ export const runBalanceWorkflow = async ({
     await page.click("button.dark_btn");
     await page.waitForTimeout(5000);
     await dismissInterruptingDialogs(page);
+    await assertNoCloudflareBlock(page, "after-login");
     await captureFrame(page, "after-login", onScreenshot);
 
     markStep("open-company-window");

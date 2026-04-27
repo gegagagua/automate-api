@@ -29,6 +29,16 @@ import {
 } from "./services/companySettings.js";
 import { getBalanceRulesDocumentation } from "./playwright/balanceRulesDocumentation.js";
 
+const resolveBalanceHeadless = (debugMode) => {
+  if (process.env.PLAYWRIGHT_BALANCE_HEADLESS === "true") {
+    return true;
+  }
+  if (process.env.PLAYWRIGHT_BALANCE_HEADLESS === "false") {
+    return false;
+  }
+  return !debugMode;
+};
+
 const app = express();
 const port = Number(process.env.PORT) || 4000;
 const __filename = fileURLToPath(import.meta.url);
@@ -782,7 +792,7 @@ app.post("/api/companies/:companyId/imports/:importId/run", async (req, res) => 
       accountCode: uploadEntry.accountCode || accountCodeOverride,
       successScreenshotPath,
       failureScreenshotPath,
-      headless: true,
+      headless: resolveBalanceHeadless(debugMode),
       slowMo: Number.isNaN(slowMoMs) ? undefined : slowMoMs,
     });
     await db.run(`DELETE FROM balance_import_row_outcomes WHERE importId = ?`, [importId]);
@@ -994,7 +1004,7 @@ app.get("/api/companies/:companyId/imports/:importId/run-stream", async (req, re
       accountCode: uploadEntry.accountCode || accountCodeOverride,
       successScreenshotPath,
       failureScreenshotPath,
-      headless: true,
+      headless: resolveBalanceHeadless(debugMode),
       slowMo: Number.isNaN(slowMoMs) ? undefined : slowMoMs,
       onStep: ({ step }) => {
         send("step", { step });
