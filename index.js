@@ -33,8 +33,11 @@ const resolveBalanceHeadless = (debugMode) => {
   if (process.env.PLAYWRIGHT_BALANCE_HEADLESS === "true") {
     return true;
   }
-  if (process.env.PLAYWRIGHT_BALANCE_HEADLESS === "false") {
+  if (process.env.PLAYWRIGHT_BALANCE_HEADLESS === "false" && process.env.DISPLAY) {
     return false;
+  }
+  if (!process.env.DISPLAY) {
+    return true;
   }
   return !debugMode;
 };
